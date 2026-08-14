@@ -1,0 +1,21 @@
+# Core RAG stack
+openai>=1.40.0
+chromadb>=0.5.5
+langchain-text-splitters>=0.2.0
+pypdf>=4.2.0
+python-dotenv>=1.0.1
+
+# User interface
+streamlit>=1.36.0
+
+# Optional FastAPI backend (bonus)
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+requests>=2.31.0
+
+# Optional: live share price (nice-to-have, not required)
+yfinance>=0.2.40
+
+# Local provider (used when PROVIDER=ollama)
+ollama>=0.4.0
