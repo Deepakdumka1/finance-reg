@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -25,9 +26,8 @@ from vector_store import get_collection, reset_collection
 def load_pdf_pages(path: str | Path) -> list[tuple[int, str]]:
     """Extract text from a PDF, one entry per page.
 
-    Returns a list of (page_number, text) tuples. Page numbers are 1-based so
-    they match what an analyst sees in a PDF viewer. Pages whose text cannot be
-    extracted (blank or scanned images) are skipped.
+    Returns (page_number, text) tuples. Page numbers are 1-based to match a PDF
+    viewer. Pages with no extractable text (blank or scanned) are skipped.
     """
     path = Path(path)
     reader = PdfReader(str(path))
@@ -40,11 +40,7 @@ def load_pdf_pages(path: str | Path) -> list[tuple[int, str]]:
 
 
 def _build_splitter() -> RecursiveCharacterTextSplitter:
-    """Recursive character splitter with the configured size and overlap.
-
-    It tries to break on paragraph, then line, then sentence, then word
-    boundaries, which keeps chunks readable and avoids cutting mid-number.
-    """
+    """Recursive character splitter with the configured size and overlap."""
     return RecursiveCharacterTextSplitter(
         chunk_size=config.CHUNK_SIZE,
         chunk_overlap=config.CHUNK_OVERLAP,
@@ -53,22 +49,50 @@ def _build_splitter() -> RecursiveCharacterTextSplitter:
     )
 
 
-def chunk_pages(file_name: str, pages: list[tuple[int, str]]) -> list[dict]:
-    """Split each page into chunks, carrying the file name and page number."""
+def _derive_quarter(file_name: str) -> str:
+    """Best-effort quarter label from a file name, e.g. 'Q1 FY26'.
+
+    Falls back to the file stem when no Q#/FY## pattern is present. The label is
+    stored as metadata AND prefixed into each chunk's text, so the quarter is
+    embedded and becomes part of what retrieval matches on - the key fix for
+    near-identical quarterly press releases (Stage 6 of the guide).
+    """
+    stem = Path(file_name).stem
+    q = re.search(r"Q\s*([1-4])", stem, re.IGNORECASE)
+    fy = re.search(r"FY\s*'?\s*(\d{2,4})", stem, re.IGNORECASE)
+    if q and fy:
+        return f"Q{q.group(1)} FY{fy.group(1)}"
+    if q:
+        return f"Q{q.group(1)}"
+    return stem.replace("_", " ")
+
+
+def chunk_pages(file_name: str, pages: list[tuple[int, str]], quarter: str) -> list[dict]:
+    """Split each page into chunks, carrying file name, page number and quarter.
+
+    Each chunk is prefixed with a source label so the file and quarter are
+    embedded with the content and retrieval can tell quarters apart.
+    """
     splitter = _build_splitter()
     chunks: list[dict] = []
     for page_number, text in pages:
-        for chunk_text in splitter.split_text(text):
-            cleaned = chunk_text.strip()
+        for piece in splitter.split_text(text):
+            cleaned = piece.strip()
             if cleaned:
+                labelled = f"[Source: {file_name} | {quarter} | page {page_number}]\n{cleaned}"
                 chunks.append(
-                    {"text": cleaned, "file": file_name, "page": page_number}
+                    {
+                        "text": labelled,
+                        "file": file_name,
+                        "page": page_number,
+                        "quarter": quarter,
+                    }
                 )
     return chunks
 
 
 def _chunk_id(file_name: str, page: int, position: int, text: str) -> str:
-    """Deterministic id so re-indexing the same file updates instead of duplicating."""
+    """Deterministic id so re-indexing a file updates instead of duplicating."""
     raw = f"{file_name}:{page}:{position}:{text[:64]}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
@@ -76,8 +100,7 @@ def _chunk_id(file_name: str, page: int, position: int, text: str) -> str:
 def ingest_paths(paths: Iterable[str | Path]) -> dict:
     """Load, chunk, embed and store the given PDFs.
 
-    Returns {"files": <int>, "chunks": <int>, "skipped": [names]} where files
-    and chunks count only what was successfully indexed this call.
+    Returns {"files", "chunks", "skipped"} counting only what was indexed now.
     """
     collection = get_collection()
     files_processed = 0
@@ -92,11 +115,11 @@ def ingest_paths(paths: Iterable[str | Path]) -> dict:
 
         pages = load_pdf_pages(path)
         if not pages:
-            # No selectable text -> almost certainly a scanned image.
-            skipped.append(f"{path.name} (no extractable text – scanned image?)")
+            skipped.append(f"{path.name} (no extractable text - scanned image?)")
             continue
 
-        chunks = chunk_pages(path.name, pages)
+        quarter = _derive_quarter(path.name)
+        chunks = chunk_pages(path.name, pages, quarter)
         if not chunks:
             skipped.append(f"{path.name} (produced no chunks)")
             continue
@@ -105,10 +128,10 @@ def ingest_paths(paths: Iterable[str | Path]) -> dict:
         for position, chunk in enumerate(chunks):
             ids.append(_chunk_id(chunk["file"], chunk["page"], position, chunk["text"]))
             documents.append(chunk["text"])
-            metadatas.append({"file": chunk["file"], "page": chunk["page"]})
+            metadatas.append(
+                {"file": chunk["file"], "page": chunk["page"], "quarter": chunk["quarter"]}
+            )
 
-        # upsert = insert or replace, so re-indexing a file is idempotent.
-        # Batch to stay well under Chroma / OpenAI request limits.
         batch = 100
         for start in range(0, len(ids), batch):
             end = start + batch
@@ -131,7 +154,7 @@ def ingest_data_dir() -> dict:
 
 
 def collection_stats() -> dict:
-    """Small summary used by the /stats endpoint and the UI sidebar."""
+    """Summary used by the /stats endpoint and the UI sidebar."""
     collection = get_collection()
     return {
         "provider": config.PROVIDER,
